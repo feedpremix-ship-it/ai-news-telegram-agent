@@ -1,46 +1,74 @@
 
 import os
-import json
 import re
+import json
 import time
-import hashlib
 import html
+import hashlib
 import calendar
 from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 import requests
 import feedparser
+from deep_translator import GoogleTranslator
 
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+
 STATE_PATH = os.getenv("STATE_PATH", "data/state.json")
 
 HEADERS = {
-    "User-Agent": "AINewsTelegramBot/1.0 RSS reader"
+    "User-Agent": "AI-News-Telegram-Agent/2.0"
 }
 
-# RSS-источники новостей об ИИ.
-# Anthropic использует стороннюю RSS-ленту.
+REQUEST_TIMEOUT = 20
+NEWS_MAX_AGE_HOURS = 72
+MAX_SEEN_ITEMS = 2000
+
 FEEDS = [
     ("OpenAI", "https://openai.com/news/rss.xml"),
-    ("Anthropic", "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml"),
+    (
+        "Anthropic",
+        "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml"
+    ),
     ("Google DeepMind", "https://deepmind.google/blog/rss.xml"),
     ("Google AI", "https://blog.google/technology/ai/rss/"),
     ("Google Research", "https://research.google/blog/rss/"),
     ("Hugging Face", "https://huggingface.co/blog/feed.xml"),
-    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    (
+        "TechCrunch AI",
+        "https://techcrunch.com/category/artificial-intelligence/feed/"
+    ),
     ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
-    ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
+    (
+        "The Verge AI",
+        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
+    ),
     ("NVIDIA AI", "https://blogs.nvidia.com/feed/"),
-    ("Microsoft Research", "https://www.microsoft.com/en-us/research/feed/"),
+    (
+        "Microsoft Research",
+        "https://www.microsoft.com/en-us/research/feed/"
+    ),
     ("Microsoft AI", "https://blogs.microsoft.com/ai/feed/"),
-    ("MIT Technology Review", "https://www.technologyreview.com/topic/artificial-intelligence/feed/"),
-    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/technology-lab"),
-    ("AWS Machine Learning", "https://aws.amazon.com/blogs/machine-learning/feed/"),
+    (
+        "MIT Technology Review",
+        "https://www.technologyreview.com/topic/artificial-intelligence/feed/"
+    ),
+    (
+        "Ars Technica",
+        "https://feeds.arstechnica.com/arstechnica/technology-lab"
+    ),
+    (
+        "AWS Machine Learning",
+        "https://aws.amazon.com/blogs/machine-learning/feed/"
+    ),
     ("The Decoder", "https://the-decoder.com/feed/"),
     ("arXiv AI", "https://rss.arxiv.org/rss/cs.AI"),
 ]
@@ -59,605 +87,612 @@ TRUSTED_DOMAINS = {
     "nvidia.com",
     "blogs.nvidia.com",
     "microsoft.com",
-    "blogs.microsoft.com",
     "technologyreview.com",
     "arstechnica.com",
     "aws.amazon.com",
     "the-decoder.com",
     "arxiv.org",
-    "export.arxiv.org",
 }
 
 GOOD_TERMS = [
-    "launch", "launched", "released", "release", "introducing",
-    "announces", "announced", "available", "update", "upgrade",
-    "new model", "open source", "open-source", "free", "image",
-    "video", "reasoning", "multimodal", "agent", "benchmark",
-    "artificial intelligence", "machine learning", "generative ai",
-    "генерац", "модель", "обновлен", "выпуст", "запуск",
-    "бесплат", "открытый код", "видео", "изображен", "доступ",
-    "нейросет", "искусственн", "интеллект", "обучен"
+    "artificial intelligence",
+    "generative ai",
+    "large language model",
+    "language model",
+    "machine learning",
+    "deep learning",
+    "neural network",
+    "AI model",
+    "AI agent",
+    "AI agents",
+    "robotics",
+    "OpenAI",
+    "ChatGPT",
+    "Claude",
+    "Gemini",
+    "DeepMind",
+    "Copilot",
+    "Hugging Face",
+    "computer vision",
+    "text-to-image",
+    "text-to-video",
+    "reasoning model",
+    "AI research",
+    "AI system",
+    "AI tool",
+    "AI technology",
+    "artificial intelligence research",
+    "LLM",
+    "GPT",
+    "multimodal",
+    "diffusion model",
 ]
 
 BAD_TERMS = [
-    "sponsored", "partner content", "advertisement", "paid post",
-    "promoted", "sponsored content", "промо-материал", "реклама",
-    "партнёрский материал", "партнерский материал"
+    "sponsored",
+    "paid partnership",
+    "advertisement",
+    "coupon code",
+    "discount code",
+    "giveaway",
+    "sign up for our newsletter",
 ]
 
-RUMOR_TERMS = [
-    "rumor", "rumour", "leak", "leaked", "reportedly",
-    "allegedly", "слух", "утечк", "предположительно",
-    "неподтвержд"
-]
 
-PRIORITY_SOURCES = {
-    "OpenAI", "Anthropic", "Google DeepMind", "Google AI",
-    "Google Research", "Hugging Face", "NVIDIA AI",
-    "Microsoft Research", "Microsoft AI"
-}
-
+# ============================================================
+# STATE
+# ============================================================
 
 def now_utc():
     return datetime.now(timezone.utc)
 
 
-def iso(dt=None):
-    return (dt or now_utc()).isoformat()
+def now_iso():
+    return now_utc().isoformat()
 
 
 def load_state():
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        if not isinstance(state, dict):
-            state = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
+    os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
 
-    defaults = {
+    default_state = {
         "paused": False,
         "seen": {},
         "telegram_offset": 0,
-        "last_scan": "",
-        "last_success": "",
-        "last_error_notice": "",
+        "last_scan": None,
+        "last_success": None,
+        "last_error_notice": None,
         "published_count": 0,
     }
 
-    for key, value in defaults.items():
-        state.setdefault(key, value)
+    if not os.path.exists(STATE_PATH):
+        return default_state
 
-    if not isinstance(state["seen"], dict):
-        state["seen"] = {}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as file:
+            loaded = json.load(file)
 
-    return state
+        if not isinstance(loaded, dict):
+            return default_state
+
+        for key, value in default_state.items():
+            loaded.setdefault(key, value)
+
+        if not isinstance(loaded.get("seen"), dict):
+            loaded["seen"] = {}
+
+        return loaded
+
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Не удалось прочитать состояние: {error}")
+        return default_state
 
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
 
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    temporary_path = STATE_PATH + ".tmp"
 
-    os.replace(tmp, STATE_PATH)
+    with open(temporary_path, "w", encoding="utf-8") as file:
+        json.dump(
+            state,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    os.replace(temporary_path, STATE_PATH)
 
 
-def tg(method, payload=None, timeout=25):
-    """Вызов Telegram API с диагностикой ошибок."""
+# ============================================================
+# TELEGRAM
+# ============================================================
 
+def telegram_api(method, payload=None, timeout=REQUEST_TIMEOUT):
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан в GitHub Secrets")
-
-    payload = dict(payload or {})
-
-    if method == "sendMessage":
-        message_text = payload.get("text")
-        if not isinstance(message_text, str) or not message_text.strip():
-            raise RuntimeError(
-                "Отправка отменена: Telegram получил пустой текст. "
-                f"Получатель: {payload.get('chat_id', 'не указан')}"
-            )
+        raise RuntimeError("Не задан секрет BOT_TOKEN")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
-    try:
-        response = requests.post(url, json=payload, timeout=timeout)
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Ошибка соединения с Telegram: {type(exc).__name__}"
-        ) from exc
+    response = requests.post(
+        url,
+        json=payload or {},
+        timeout=timeout
+    )
 
     try:
         data = response.json()
-    except ValueError as exc:
+    except ValueError:
         raise RuntimeError(
-            f"Telegram вернул не JSON: HTTP {response.status_code}"
-        ) from exc
+            f"Telegram вернул HTTP {response.status_code}"
+        )
 
     if not response.ok or not data.get("ok"):
-        code = data.get("error_code", response.status_code)
-        description = data.get("description", "Причина не указана")
+        description = data.get("description", response.text[:500])
         raise RuntimeError(
-            f"Telegram API, метод {method}: HTTP "
-            f"{response.status_code}, код {code}: {description}"
+            f"Telegram API, метод {method}: "
+            f"HTTP {response.status_code}: {description}"
         )
 
     return data.get("result")
 
 
+def send_message(chat_id, text):
+    if not text or not text.strip():
+        raise ValueError("Нельзя отправить пустое сообщение")
+
+    # Отключаем предпросмотр ссылки, чтобы Telegram
+    # не показывал изображение или карточку сайта.
+    return telegram_api(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+    )
+
+
 def notify_admin(message):
+    if not ADMIN_CHAT_ID:
+        print(f"Уведомление администратору не отправлено: {message}")
+        return
+
+    try:
+        send_message(
+            ADMIN_CHAT_ID,
+            "🤖 <b>AI News Agent</b>\n" + html.escape(message)
+        )
+    except Exception as error:
+        print(f"Не удалось уведомить администратора: {error}")
+
+
+def handle_commands(state):
+    """
+    Обрабатывает команды администратора:
+    /status
+    /pause
+    /resume
+    """
+
     if not ADMIN_CHAT_ID:
         return
 
-    message = str(message or "").strip()
-    if not message:
-        return
-
     try:
-        tg("sendMessage", {
-            "chat_id": ADMIN_CHAT_ID,
-            "text": message[:3900],
-            "disable_web_page_preview": True
-        })
-    except Exception as exc:
-        print(
-            "Не удалось уведомить администратора:",
-            type(exc).__name__,
-            str(exc)[:250]
+        offset = int(state.get("telegram_offset", 0) or 0)
+
+        result = telegram_api(
+            "getUpdates",
+            {
+                "offset": offset,
+                "timeout": 0,
+                "allowed_updates": ["message"],
+            },
+            timeout=10,
         )
 
+    except Exception as error:
+        print(f"Ошибка проверки команд Telegram: {error}")
+        return
 
-def clean_html(value):
-    value = str(value or "")
-    value = re.sub(
-        r"<(script|style).*?</\1>",
-        " ",
-        value,
-        flags=re.I | re.S
-    )
-    value = re.sub(r"<[^>]+>", " ", value)
-    value = html.unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
+    for update in result or []:
+        update_id = update.get("update_id", 0)
+        state["telegram_offset"] = update_id + 1
 
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        text = (message.get("text") or "").strip()
 
-def entry_date(entry):
-    for key in (
-        "published_parsed",
-        "updated_parsed",
-        "created_parsed"
-    ):
-        parsed = entry.get(key)
-        if parsed:
-            try:
-                return datetime.fromtimestamp(
-                    calendar.timegm(parsed),
-                    tz=timezone.utc
+        # Принимаем команды только от указанного администратора.
+        if str(chat.get("id", "")) != str(ADMIN_CHAT_ID):
+            continue
+
+        command = text.split()[0].split("@")[0].lower() if text else ""
+
+        try:
+            if command == "/pause":
+                state["paused"] = True
+                save_state(state)
+                send_message(
+                    ADMIN_CHAT_ID,
+                    "⏸ Агент приостановлен. Новые публикации остановлены."
                 )
-            except (ValueError, OverflowError, OSError):
-                pass
 
-    for key in ("published", "updated", "created"):
-        raw = entry.get(key)
-        if raw:
-            try:
-                dt = parsedate_to_datetime(raw)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone.utc)
-            except Exception:
-                pass
+            elif command == "/resume":
+                state["paused"] = False
+                save_state(state)
+                send_message(
+                    ADMIN_CHAT_ID,
+                    "▶️ Агент возобновлён."
+                )
 
-    return None
+            elif command == "/status":
+                status = "приостановлен" if state["paused"] else "активен"
+
+                send_message(
+                    ADMIN_CHAT_ID,
+                    "<b>Статус AI News Agent</b>\n"
+                    f"Состояние: {status}\n"
+                    f"Опубликовано: {state.get('published_count', 0)}\n"
+                    f"Последнее сканирование: "
+                    f"{html.escape(str(state.get('last_scan') or 'ещё не было'))}\n"
+                    f"Последняя публикация: "
+                    f"{html.escape(str(state.get('last_success') or 'ещё не было'))}"
+                )
+
+        except Exception as error:
+            print(f"Ошибка обработки команды {command}: {error}")
+
+    save_state(state)
+
+
+# ============================================================
+# TEXT AND SOURCE VALIDATION
+# ============================================================
+
+def clean_text(value):
+    if not value:
+        return ""
+
+    value = re.sub(r"<[^>]+>", " ", str(value))
+    value = html.unescape(value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
 
 
 def domain_ok(url):
-    host = (urlparse(url).hostname or "").lower()
-    return any(
-        host == domain or host.endswith("." + domain)
-        for domain in TRUSTED_DOMAINS
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in TRUSTED_DOMAINS
+        )
+
+    except Exception:
+        return False
+
+
+def entry_date(entry):
+    parsed = (
+        entry.get("published_parsed")
+        or entry.get("updated_parsed")
+        or entry.get("created_parsed")
     )
 
-
-def stable_id(url, title):
-    key = (
-        (url or "").split("#")[0].split("?")[0].rstrip("/")
-        or title.lower().strip()
-    )
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
-
-
-def translate_ru(text):
-    text = clean_html(text)
-    if not text:
-        return ""
-
-    # Не вызываем переводчик, если текст уже содержит кириллицу.
-    if re.search(r"[А-Яа-яЁё]", text):
-        return text
+    if not parsed:
+        return None
 
     try:
-        from deep_translator import GoogleTranslator
+        timestamp = calendar.timegm(parsed)
+        return datetime.fromtimestamp(timestamp, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
 
+
+def stable_id(entry, url, title):
+    original_id = entry.get("id") or entry.get("guid") or url
+
+    value = f"{original_id}|{title}".encode("utf-8")
+
+    return hashlib.sha256(value).hexdigest()[:24]
+
+
+def is_russian(text):
+    """
+    Не позволяет опубликовать заголовок,
+    который остался полностью на английском.
+    """
+    cyrillic_count = len(re.findall(r"[А-Яа-яЁё]", text))
+    return cyrillic_count >= 3
+
+
+# ============================================================
+# TRANSLATION
+# ============================================================
+
+def translate_title_to_russian(title):
+    """
+    Возвращает только русский заголовок.
+    Если перевод не удался или остался английским,
+    возвращает None: исходный английский текст не публикуется.
+    """
+
+    title = clean_text(title)
+
+    if not title:
+        return None
+
+    # Если заголовок уже на русском, перевод не нужен.
+    if is_russian(title):
+        return title
+
+    try:
         translated = GoogleTranslator(
             source="auto",
             target="ru"
-        ).translate(text[:4500])
+        ).translate(title)
 
-        return clean_html(translated) or text
+        translated = clean_text(translated)
 
-    except Exception as exc:
-        print(
-            "Перевод недоступен; оставляю оригинал:",
-            type(exc).__name__,
-            str(exc)[:160]
-        )
-        return text
+        if not translated or not is_russian(translated):
+            print(f"Заголовок не удалось перевести на русский: {title}")
+            return None
 
+        return translated
 
-def is_rumor(text):
-    low = (text or "").lower()
-    return any(term in low for term in RUMOR_TERMS)
+    except Exception as error:
+        print(f"Ошибка перевода заголовка: {error}")
+        return None
 
 
-def score_item(title, summary, source, published):
-    blob = f"{title} {summary}".lower()
+# ============================================================
+# NEWS FILTERING
+# ============================================================
 
-    if any(term in blob for term in BAD_TERMS):
-        return -100
+def score_item(title, description):
+    text = f"{title} {description}".lower()
 
-    score = 1
-    score += sum(1 for term in GOOD_TERMS if term in blob)
+    if any(term.lower() in text for term in BAD_TERMS):
+        return 0
 
-    if source in PRIORITY_SOURCES:
-        score += 2
+    score = 0
 
-    if is_rumor(blob):
-        score -= 1
-
-    if published and published > now_utc() - timedelta(hours=24):
-        score += 2
-
-    if len(title.strip()) < 12:
-        score -= 2
+    for term in GOOD_TERMS:
+        if term.lower() in text:
+            score += 1
 
     return score
 
 
-def fetch_candidates():
+def fetch_candidates(state):
     candidates = []
     errors = []
-    cutoff = now_utc() - timedelta(hours=72)
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    cutoff = now_utc() - timedelta(hours=NEWS_MAX_AGE_HOURS)
+    seen = state.get("seen", {})
 
-    for source, feed_url in FEEDS:
+    for source_name, feed_url in FEEDS:
         try:
-            response = session.get(feed_url, timeout=20)
+            response = requests.get(
+                feed_url,
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
             response.raise_for_status()
 
-            feed = feedparser.parse(response.content)
+            parsed = feedparser.parse(response.content)
 
-            if not feed.entries:
-                errors.append(f"{source}: RSS не вернул записей")
-                continue
+            if parsed.bozo and not parsed.entries:
+                raise RuntimeError("Не удалось разобрать RSS")
 
-            if getattr(feed, "bozo", False):
-                print(f"Предупреждение RSS {source}: некорректный формат ленты")
+            for entry in parsed.entries:
+                title = clean_text(entry.get("title", ""))
+                url = (entry.get("link") or "").strip()
 
-            for entry in feed.entries[:30]:
-                title = clean_html(entry.get("title", ""))
-                url = str(entry.get("link", "") or "").strip()
-                summary = clean_html(
-                    entry.get("summary")
-                    or entry.get("description")
-                    or ""
-                )
+                if not title or not url:
+                    continue
+
+                # Только проверенные источники.
+                if not domain_ok(url):
+                    continue
+
                 published = entry_date(entry)
 
-                if not title or not url or not domain_ok(url):
+                # Не публикуем старые новости и материалы
+                # с неизвестной датой публикации.
+                if published is None or published < cutoff:
                     continue
 
-                # Не публикуем записи без даты или слишком старые записи.
-                if published is None:
+                description = clean_text(
+                    entry.get("summary", "")
+                    or entry.get("description", "")
+                )
+
+                item_id = stable_id(entry, url, title)
+
+                if item_id in seen:
                     continue
 
-                if (
-                    published > now_utc() + timedelta(hours=12)
-                    or published < cutoff
-                ):
+                score = score_item(title, description)
+
+                if score <= 0:
                     continue
 
-                score = score_item(title, summary, source, published)
+                candidates.append({
+                    "id": item_id,
+                    "source": source_name,
+                    "title": title,
+                    "url": url,
+                    "published": published,
+                    "score": score,
+                })
 
-                if score >= 2:
-                    candidates.append({
-                        "id": stable_id(url, title),
-                        "source": source,
-                        "title": title,
-                        "url": url,
-                        "summary": summary[:1200],
-                        "published": published,
-                        "score": score,
-                        "rumor": is_rumor(title + " " + summary)
-                    })
+        except Exception as error:
+            message = f"{source_name}: {error}"
+            print(f"Ошибка RSS: {message}")
+            errors.append(message)
 
-        except Exception as exc:
-            errors.append(
-                f"{source}: {type(exc).__name__}: {str(exc)[:160]}"
-            )
-
-    session.close()
-
+    # Сначала более свежие новости, затем релевантность.
     candidates.sort(
-        key=lambda item: (item["score"], item["published"]),
-        reverse=True
+        key=lambda item: (
+            item["published"],
+            item["score"],
+        ),
+        reverse=True,
+    )
+
+    print(
+        f"Подходящих новостей: {len(candidates)}; "
+        f"ошибок RSS: {len(errors)}"
     )
 
     return candidates, errors
 
 
-def make_post(item):
-    title = clean_html(item.get("title", ""))
-    summary = clean_html(item.get("summary", ""))
+# ============================================================
+# PUBLISHING
+# ============================================================
 
-    if not title:
-        raise RuntimeError("У новости пустой заголовок.")
+def make_post(russian_title, source_url):
+    """
+    Формат публикации:
+    русский заголовок
+    ссылка на первоисточник
 
-    title_ru = translate_ru(title).strip() or title
+    Никаких картинок, описаний или предпросмотра ссылки.
+    """
 
-    if summary:
-        summary_ru = translate_ru(summary).strip() or summary
-    else:
-        summary_ru = ""
+    safe_title = html.escape(russian_title)
+    safe_url = html.escape(source_url, quote=True)
 
-    if not summary_ru:
-        summary_ru = "Ключевая информация — в материале источника."
-
-    summary_ru = summary_ru[:650].strip()
-
-    source = clean_html(item.get("source", "Источник"))
-    url = str(item.get("url", "") or "").strip()
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise RuntimeError("У новости отсутствует корректная ссылка.")
-
-    rumor_label = ""
-    if item.get("rumor"):
-        rumor_label = "⚠️ <b>Слух / не подтверждено</b>\n\n"
-
-    useful = (
-        "Полезно тем, кто следит за новыми возможностями "
-        "ИИ и нейросетей."
+    return (
+        f"<b>{safe_title}</b>\n\n"
+        f'<a href="{safe_url}">Источник</a>'
     )
-
-    post = (
-        f"{rumor_label}"
-        f"🤖 <b>{html.escape(title_ru[:220])}</b>\n\n"
-        f"{html.escape(summary_ru)}\n\n"
-        f"💡 <b>Кому полезно:</b> {useful}\n\n"
-        f"#нейросети #ИИ #AI\n"
-        f"Источник: <a href=\"{html.escape(url, quote=True)}\">"
-        f"{html.escape(source or 'Источник')}</a>"
-    ).strip()
-
-    if not post:
-        raise RuntimeError("Не удалось сформировать текст новости.")
-
-    if len(post) > 4000:
-        raise RuntimeError(
-            f"Сообщение слишком длинное: {len(post)} символов."
-        )
-
-    return post
-
-
-def handle_commands(state):
-    changed = False
-
-    try:
-        updates = tg("getUpdates", {
-            "offset": int(state.get("telegram_offset", 0)),
-            "timeout": 1,
-            "allowed_updates": ["message"]
-        }, timeout=8)
-
-        for update in updates or []:
-            state["telegram_offset"] = max(
-                int(state.get("telegram_offset", 0)),
-                int(update["update_id"]) + 1
-            )
-
-            msg = update.get("message") or {}
-            chat = msg.get("chat") or {}
-            command_text = (msg.get("text") or "").strip()
-            command = command_text.split()[0].split("@")[0].lower() if command_text else ""
-            chat_id = str(chat.get("id", ""))
-
-            if not ADMIN_CHAT_ID or chat_id != ADMIN_CHAT_ID:
-                continue
-
-            if command == "/start":
-                tg("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": (
-                        "Команды агента:\n"
-                        "/status — состояние\n"
-                        "/pause — приостановить публикации\n"
-                        "/resume — возобновить публикации"
-                    )
-                })
-
-            elif command == "/status":
-                tg("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": (
-                        f"Статус: {'пауза' if state['paused'] else 'работает'}\n"
-                        f"Последняя проверка: {state.get('last_scan') or 'ещё не запускался'}\n"
-                        f"Последняя публикация: {state.get('last_success') or 'пока нет'}\n"
-                        f"Опубликовано агентом: {state.get('published_count', 0)}"
-                    )
-                })
-
-            elif command == "/pause":
-                state["paused"] = True
-                tg("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "Публикации приостановлены."
-                })
-
-            elif command == "/resume":
-                state["paused"] = False
-                tg("sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "Публикации возобновлены."
-                })
-
-            changed = True
-
-    except Exception as exc:
-        print(
-            "Ошибка проверки команд:",
-            type(exc).__name__,
-            str(exc)[:250]
-        )
-
-    return changed
 
 
 def prune_seen(state):
-    cutoff = now_utc() - timedelta(days=7)
-    cleaned = {}
+    seen = state.get("seen", {})
 
-    for key, value in state.get("seen", {}).items():
+    if len(seen) <= MAX_SEEN_ITEMS:
+        return
+
+    ordered = sorted(
+        seen.items(),
+        key=lambda item: item[1] or "",
+        reverse=True,
+    )
+
+    state["seen"] = dict(ordered[:MAX_SEEN_ITEMS])
+
+
+def notify_rss_errors(state, errors):
+    if len(errors) < 4:
+        return
+
+    last_notice = state.get("last_error_notice")
+
+    if last_notice:
         try:
-            dt = datetime.fromisoformat(
-                value.replace("Z", "+00:00")
-            )
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            if dt >= cutoff:
-                cleaned[key] = value
-        except Exception:
-            continue
+            last_time = datetime.fromisoformat(last_notice)
 
-    state["seen"] = cleaned
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+
+            # Не отправляем уведомления об RSS-ошибках
+            # чаще одного раза в шесть часов.
+            if now_utc() - last_time < timedelta(hours=6):
+                return
+
+        except (ValueError, TypeError):
+            pass
+
+    summary = "\n".join(errors[:8])
+
+    notify_admin(
+        "Проблемы с RSS-источниками:\n" + summary
+    )
+
+    state["last_error_notice"] = now_iso()
 
 
 def main():
-    if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_CHAT_ID:
-        raise RuntimeError(
-            "Проверь GitHub Secrets: нужны BOT_TOKEN, CHANNEL_ID и ADMIN_CHAT_ID."
-        )
+    if not BOT_TOKEN:
+        raise RuntimeError("В GitHub Secrets отсутствует BOT_TOKEN")
+
+    if not CHANNEL_ID:
+        raise RuntimeError("В GitHub Secrets отсутствует CHANNEL_ID")
 
     state = load_state()
+
+    # Сначала проверяем команды администратора.
     handle_commands(state)
-    prune_seen(state)
-
-    last_scan = None
-
-    if state.get("last_scan"):
-        try:
-            last_scan = datetime.fromisoformat(
-                state["last_scan"].replace("Z", "+00:00")
-            )
-        except Exception:
-            last_scan = None
-
-    due = (
-        last_scan is None
-        or now_utc() - last_scan >= timedelta(minutes=28)
-    )
 
     if state.get("paused"):
+        print("Агент приостановлен. Публикация пропущена.")
+        state["last_scan"] = now_iso()
         save_state(state)
-        print("Публикации приостановлены.")
         return
 
-    if not due:
-        save_state(state)
-        print("Проверка ещё не требуется.")
-        return
+    state["last_scan"] = now_iso()
 
-    state["last_scan"] = iso()
+    candidates, errors = fetch_candidates(state)
+    notify_rss_errors(state, errors)
 
-    candidates, errors = fetch_candidates()
+    # Публикуем не более одной новости за запуск.
+    # Если перевод не удался, пробуем следующую новость.
+    for item in candidates:
+        russian_title = translate_title_to_russian(item["title"])
 
-    print(
-        f"Найдено кандидатов: {len(candidates)}; "
-        f"ошибок источников: {len(errors)}"
-    )
+        if not russian_title:
+            print(
+                "Новость пропущена: нет надёжного русского заголовка. "
+                f"Источник: {item['source']}"
+            )
+            continue
 
-    candidate = next(
-        (item for item in candidates if item["id"] not in state["seen"]),
-        None
-    )
-
-    if candidate:
-        post = make_post(candidate)
-
-        print(
-            f"Подготовлена публикация: {candidate['source']}; "
-            f"длина: {len(post)} символов."
+        post_text = make_post(
+            russian_title,
+            item["url"],
         )
 
-        # CHANNEL_ID для публичного канала должен быть @username.
-        # Для приватного канала используй числовой ID вида -100...
-        tg("sendMessage", {
-            "chat_id": CHANNEL_ID,
-            "text": post,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        })
+        try:
+            send_message(CHANNEL_ID, post_text)
 
-        # Помечаем новость только после успешной отправки.
-        state["seen"][candidate["id"]] = iso()
-        state["last_success"] = iso()
-        state["published_count"] = int(
-            state.get("published_count", 0)
-        ) + 1
-
-        print("Опубликовано:", candidate["title"])
-
-    else:
-        print("Новых подходящих новостей нет.")
-
-    if errors and len(errors) >= 4:
-        last_notice = state.get("last_error_notice")
-        allowed = True
-
-        if last_notice:
-            try:
-                previous = datetime.fromisoformat(
-                    last_notice.replace("Z", "+00:00")
-                )
-                allowed = (
-                    now_utc() - previous >= timedelta(hours=6)
-                )
-            except Exception:
-                pass
-
-        if allowed:
-            notify_admin(
-                "⚠️ Ошибки при проверке RSS-источников:\n"
-                + "\n".join(errors[:8])
+            # Сохраняем ID только после успешной отправки.
+            state.setdefault("seen", {})[item["id"]] = now_iso()
+            state["last_success"] = now_iso()
+            state["published_count"] = (
+                int(state.get("published_count", 0)) + 1
             )
-            state["last_error_notice"] = iso()
+
+            prune_seen(state)
+            save_state(state)
+
+            print(
+                f"Опубликовано: {russian_title} "
+                f"(источник: {item['source']})"
+            )
+            return
+
+        except Exception as error:
+            print(f"Ошибка публикации в Telegram: {error}")
+            raise
+
+    print(
+        "Новых новостей с корректным русским заголовком "
+        "для публикации не найдено."
+    )
 
     save_state(state)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        message = (
-            f"Критическая ошибка: {type(exc).__name__}: "
-            f"{str(exc)[:900]}"
-        )
-        print(message)
-        notify_admin("🚨 Агент новостей столкнулся с ошибкой:\n" + message)
-        raise
+    main()
+
